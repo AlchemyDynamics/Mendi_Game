@@ -1,28 +1,752 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
-  <title>Mendi Game</title>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no"/>
+  <title>High Altitude</title>
   <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body { background: #111; display: flex; align-items: center; justify-content: center; height: 100vh; }
-    canvas { display: block; }
+    * { margin:0; padding:0; box-sizing:border-box; }
+    body { background:#000; overflow:hidden; font-family:monospace; }
+    canvas { display:block; }
+
+    #zone {
+      position:fixed; top:20px; left:50%; transform:translateX(-50%);
+      color:rgba(255,255,255,0.7); font-size:13px; letter-spacing:3px;
+      text-transform:uppercase; text-shadow:0 1px 6px rgba(0,0,0,0.9);
+      pointer-events:none;
+    }
+
+    #connect-btn {
+      position:fixed; bottom:44px; left:50%; transform:translateX(-50%);
+      background:rgba(255,255,255,0.92); color:#111; border:none;
+      padding:13px 30px; font-size:16px; font-family:monospace;
+      cursor:pointer; border-radius:6px; pointer-events:all;
+      box-shadow:0 2px 16px rgba(0,0,0,0.5);
+    }
+    #connect-btn:disabled { opacity:0.4; cursor:default; }
+
+    #status {
+      position:fixed; bottom:20px; left:50%; transform:translateX(-50%);
+      color:rgba(255,255,255,0.35); font-size:11px; pointer-events:none;
+    }
+
+    #calib {
+      position:fixed; top:0; left:0; right:0; bottom:0;
+      background:rgba(0,0,0,0.78);
+      display:none; flex-direction:column;
+      align-items:center; justify-content:center; color:#fff;
+    }
+    #calib h2 { font-size:22px; margin-bottom:10px; letter-spacing:2px; }
+    #calib p  { color:#888; font-size:13px; margin-bottom:28px; }
+    #calib-n  { font-size:80px; color:#7eb8f7; line-height:1; }
+
+    #crash-msg {
+      position:fixed; top:50%; left:50%; transform:translate(-50%,-50%);
+      color:#ff4444; font-size:28px; letter-spacing:4px;
+      text-shadow:0 0 20px rgba(255,0,0,0.8); display:none; pointer-events:none;
+    }
   </style>
 </head>
 <body>
-  <canvas id="c"></canvas>
-  <script>
-    const canvas = document.getElementById('c');
-    const ctx = canvas.getContext('2d');
+<canvas id="c"></canvas>
+<div id="zone"></div>
+<div id="calib">
+  <h2>Calibrating</h2>
+  <p>Sit still and breathe normally</p>
+  <div id="calib-n">10</div>
+</div>
+<div id="crash-msg">CRASHED</div>
+<button id="connect-btn">Connect Mendi</button>
+<div id="status">Demo mode — no device connected</div>
 
-    canvas.width = window.innerWidth;
-    canvas.height = window.innerHeight;
+<script>
+'use strict';
 
+// ── BLE ──────────────────────────────────────────────────────────────────────
+const BLE_SERVICE = 'fc3eabb0-c6c4-49e6-922a-6e551c455af5';
+const BB4_UUID    = 'fc3eabb4-c6c4-49e6-922a-6e551c455af5';
+
+// ── CANVAS ───────────────────────────────────────────────────────────────────
+const canvas = document.getElementById('c');
+const ctx    = canvas.getContext('2d');
+let W, H, GY;
+function resize() {
+  W  = canvas.width  = window.innerWidth;
+  H  = canvas.height = window.innerHeight;
+  GY = H * 0.84;   // ground line Y
+}
+resize();
+window.addEventListener('resize', resize);
+
+// ── PHYSICS CONSTANTS ────────────────────────────────────────────────────────
+const GRAVITY    = 0.000010;   // downward pull per frame
+const LIFT_SCALE = 0.000120;   // max upward force per frame
+const LIFT_ZERO  = 0.47;       // control value at which lift = gravity (neutral hover ~0.55)
+const DAMPING    = 0.960;      // velocity damping per frame
+const CRASH_VEL  = -0.0012;    // downward velocity that triggers crash (terminal fall ≈ -0.0016, so hard dives crash, gentle descents land)
+
+// ── STATE ────────────────────────────────────────────────────────────────────
+const ble = { connected: false };
+const sig = {
+  buf:          [],
+  control:      0.5,
+  baseline:     170,
+  range:        30,
+  calibSamples: [],
+  calibDone:    false,
+};
+const bal = { alt: 0, vel: 0, flame: 0, crashed: false, crashT: 0 };
+let scrollX   = 0;
+let demoT     = 0;
+let lastTS    = 0;
+let gameReady = false;
+
+// ── ZONES ────────────────────────────────────────────────────────────────────
+const ZONES = [
+  { lo:0.00, hi:0.05, name:'Ground Level'     },
+  { lo:0.05, hi:0.20, name:'Low Atmosphere'   },
+  { lo:0.20, hi:0.48, name:'Cloud Layer'      },
+  { lo:0.48, hi:0.65, name:'Open Sky'         },
+  { lo:0.65, hi:0.76, name:'30,000 ft'        },
+  { lo:0.76, hi:0.88, name:'Upper Atmosphere' },
+  { lo:0.88, hi:1.00, name:'Space'            },
+];
+const getZone = a => ZONES.find(z => a >= z.lo && a < z.hi) || ZONES.at(-1);
+
+// ── HASH ─────────────────────────────────────────────────────────────────────
+function hash(n) {
+  n = Math.imul(n ^ (n >>> 16), 0x45d9f3b);
+  n = Math.imul(n ^ (n >>> 16), 0x45d9f3b);
+  return ((n ^ (n >>> 16)) >>> 0) / 0xffffffff;
+}
+
+// ── COLOR ────────────────────────────────────────────────────────────────────
+function lerp3(r1,g1,b1, r2,g2,b2, t) {
+  return `rgb(${r1+(r2-r1)*t|0},${g1+(g2-g1)*t|0},${b1+(b2-b1)*t|0})`;
+}
+function skyColorTop(a) {
+  if (a < 0.30) return lerp3(110,190,230, 48,110,200, a/0.30);
+  if (a < 0.65) return lerp3(48,110,200,  14,22, 80, (a-0.30)/0.35);
+  if (a < 0.85) return lerp3(14,22, 80,    5, 5, 16, (a-0.65)/0.20);
+  return 'rgb(2,2,8)';
+}
+function skyColorBot(a) {
+  if (a < 0.30) return lerp3(180,225,248, 110,190,230, a/0.30);
+  if (a < 0.65) return lerp3(110,190,230,  30, 70,150, (a-0.30)/0.35);
+  if (a < 0.85) return lerp3(30,70,150,    8,  8, 30, (a-0.65)/0.20);
+  return 'rgb(4,4,14)';
+}
+
+// ── TERRAIN ──────────────────────────────────────────────────────────────────
+function terrainY(wx) {
+  return GY + Math.sin(wx*0.0022)*30 + Math.sin(wx*0.0065+1.3)*16 + Math.sin(wx*0.018+2.8)*8;
+}
+const CHUNK = 75;
+function hasTree(ci) { return hash(ci*7+3)  < 0.36; }
+function isPine(ci)  { return hash(ci*13+5) > 0.50; }
+function treeH(ci)   { return 28 + hash(ci*17+9)*42; }
+
+// ── CLOUDS ───────────────────────────────────────────────────────────────────
+const clouds = [];
+function makeCloud(wx) {
+  const r = Math.random();
+  return { wx, tier: Math.floor(r*3), w: 90+r*170, h: 28+r*52, parallax: 0.22+r*0.50, alpha: 0.70+r*0.28 };
+}
+for (let i = 0; i < 16; i++) clouds.push(makeCloud(Math.random()*W*4));
+// Altitude bands per cloud tier: [visible-lo, visible-hi, screen-Y-fraction]
+const CLOUD_TIER = [[0.10,0.58, 0.26],[0.22,0.65, 0.18],[0.35,0.70, 0.12]];
+
+// ── BIRDS ────────────────────────────────────────────────────────────────────
+const birds = [];
+let nextBirdWX = W * 1.8;
+function spawnBirds(wx) {
+  const n = 3 + Math.floor(Math.random()*6);
+  const band = 0.24 + Math.random()*0.24;
+  for (let i = 0; i < n; i++) {
+    birds.push({ wx: wx+i*48+(Math.random()-0.5)*32, band, wing: Math.random()*Math.PI*2, speed: 2.0+Math.random()*1.4 });
+  }
+}
+
+// ── JET ──────────────────────────────────────────────────────────────────────
+const jet = { wx: -9999, active: false, dir: 1 };
+function spawnJet() {
+  if (jet.active) return;
+  jet.dir = Math.random() > 0.5 ? 1 : -1;
+  jet.wx  = jet.dir === 1 ? scrollX - 150 : scrollX + W + 150;
+  jet.active = true;
+}
+
+// ── STARS ────────────────────────────────────────────────────────────────────
+const STARS = Array.from({length:260}, () => ({
+  x: Math.random(), y: Math.random()*0.90, r: 0.4+Math.random()*1.8, ph: Math.random()*Math.PI*2
+}));
+
+// ── SATELLITES ───────────────────────────────────────────────────────────────
+const SATELLITES = Array.from({length:5}, (_, i) => ({
+  xFrac:   hash(i*31) ,            // starting X fraction (0-1)
+  yFrac:   0.05 + hash(i*17)*0.55, // screen Y fraction
+  speed:   (0.006 + hash(i*23)*0.012) * (i%2===0 ? 1 : -1),
+  size:    10 + hash(i*41)*10,
+}));
+
+// ── SHOOTING STARS ───────────────────────────────────────────────────────────
+const shooters = [];
+let nextShooterT = 4;
+
+// ── SIGNAL ───────────────────────────────────────────────────────────────────
+function pushRaw(v) {
+  sig.buf.push(v);
+  if (sig.buf.length > 6) sig.buf.shift();
+  const sm = sig.buf.reduce((a,b) => a+b, 0) / sig.buf.length;
+  if (!sig.calibDone) { sig.calibSamples.push(sm); return; }
+  // Normalize: map (sm - baseline) relative to observed range → 0..1
+  sig.control = Math.max(0, Math.min(1, (sm - sig.baseline) / (sig.range * 0.5) * 0.5 + 0.5));
+}
+function finishCalib() {
+  const s = sig.calibSamples;
+  if (s.length > 0) { // no samples yet (slow connect) → keep default baseline/range, avoid NaN
+    sig.baseline = s.reduce((a,b)=>a+b,0) / s.length;
+    sig.range    = Math.max(10, Math.max(...s) - Math.min(...s)); // no extra padding → full sensitivity
+  }
+  sig.calibDone = true;
+  gameReady     = true;
+  document.getElementById('calib').style.display = 'none';
+}
+
+// ── BLE ──────────────────────────────────────────────────────────────────────
+document.getElementById('connect-btn').addEventListener('click', async () => {
+  const btn = document.getElementById('connect-btn');
+  const sts = document.getElementById('status');
+  btn.disabled = true;
+
+  // Start calibration countdown immediately — BLE connect runs in parallel
+  sig.calibSamples = []; sig.calibDone = false; gameReady = false;
+  const ov = document.getElementById('calib'), cn = document.getElementById('calib-n');
+  ov.style.display = 'flex';
+  let secs = 10; cn.textContent = secs;
+  const iv = setInterval(() => {
+    cn.textContent = --secs;
+    if (secs <= 0) { clearInterval(iv); finishCalib(); }
+  }, 1000);
+
+  sts.textContent = 'Connecting...';
+  try {
+    const dev = await navigator.bluetooth.requestDevice({ filters:[{services:[BLE_SERVICE]}], optionalServices:[BLE_SERVICE] });
+    const srv = await dev.gatt.connect();
+    const svc = await srv.getPrimaryService(BLE_SERVICE);
+    const ch  = await svc.getCharacteristic(BB4_UUID);
+    await ch.startNotifications();
+    ch.addEventListener('characteristicvaluechanged', e => {
+      const v = e.target.value;
+      const b = new Uint8Array(v.buffer, v.byteOffset, v.byteLength);
+      if (b.length >= 2) pushRaw(b[1]);
+    });
+    ble.connected = true;
+    sts.textContent = 'Connected — calibrating...';
+    btn.textContent = 'Connected';
+    dev.addEventListener('gattserverdisconnected', () => {
+      ble.connected = false; sts.textContent = 'Disconnected — demo mode';
+      btn.disabled = false; btn.textContent = 'Reconnect';
+    });
+  } catch(e) {
+    clearInterval(iv);
+    ov.style.display = 'none';
+    sig.calibDone = true; gameReady = true; // fall back to demo
+    sts.textContent = 'Error: ' + e.message;
+    btn.disabled = false;
+  }
+});
+
+// ── DRAW: SKY ────────────────────────────────────────────────────────────────
+function drawSky(a) {
+  const g = ctx.createLinearGradient(0,0,0,H);
+  g.addColorStop(0, skyColorTop(a));
+  g.addColorStop(1, skyColorBot(a));
+  ctx.fillStyle = g;
+  ctx.fillRect(0,0,W,H);
+}
+
+// ── DRAW: STARS ──────────────────────────────────────────────────────────────
+function drawStars(a, t) {
+  const op = Math.max(0, (a - 0.68) / 0.20);
+  if (op <= 0) return;
+  ctx.save();
+  STARS.forEach(s => {
+    ctx.globalAlpha = op * (0.5 + 0.5*Math.sin(t*1.6+s.ph));
     ctx.fillStyle = '#fff';
-    ctx.font = '32px monospace';
-    ctx.textAlign = 'center';
-    ctx.fillText('Mendi Game', canvas.width / 2, canvas.height / 2);
-  </script>
+    ctx.beginPath(); ctx.arc(s.x*W, s.y*H, s.r, 0, Math.PI*2); ctx.fill();
+  });
+  ctx.restore();
+}
+
+// ── DRAW: EARTH CURVE (only at bottom of screen when in space) ───────────────
+function drawEarth(a) {
+  const op = Math.max(0, (a - 0.82) / 0.12);
+  if (op <= 0) return;
+  ctx.save();
+  // Clip to bottom 35% of screen so it never bleeds into the top
+  ctx.beginPath(); ctx.rect(0, H*0.65, W, H*0.35); ctx.clip();
+  const cy = H + H * 0.35;  // earth center well below screen
+  const r  = H * 1.6;
+  const g  = ctx.createRadialGradient(W/2, cy, r*0.80, W/2, cy, r);
+  g.addColorStop(0,   `rgba(30,110,65,${op*0.95})`);
+  g.addColorStop(0.5, `rgba(20,80,50,${op*0.70})`);
+  g.addColorStop(1,   'rgba(10,50,30,0)');
+  ctx.fillStyle = g;
+  ctx.beginPath(); ctx.arc(W/2, cy, r, 0, Math.PI*2); ctx.fill();
+  // Thin atmosphere glow at horizon
+  const atm = ctx.createLinearGradient(0, H*0.65, 0, H*0.78);
+  atm.addColorStop(0, 'rgba(40,120,200,0)');
+  atm.addColorStop(1, `rgba(40,120,200,${op*0.35})`);
+  ctx.fillStyle = atm;
+  ctx.fillRect(0, H*0.65, W, H*0.13);
+  ctx.restore();
+}
+
+// ── DRAW: SATELLITES ─────────────────────────────────────────────────────────
+function drawSatellites(a, t) {
+  const op = Math.max(0, (a - 0.88) / 0.08);
+  if (op <= 0) return;
+  ctx.save();
+  SATELLITES.forEach(s => {
+    const sx = ((s.xFrac + t * s.speed) % 1 + 1) % 1 * W;
+    const sy = s.yFrac * H * 0.88;
+    const sz = s.size;
+    ctx.globalAlpha = op * 0.85;
+    // Solar panels (horizontal arms)
+    ctx.fillStyle = '#3366bb';
+    ctx.fillRect(sx - sz*2.2, sy - sz*0.28, sz*1.8, sz*0.56);  // left
+    ctx.fillRect(sx + sz*0.4, sy - sz*0.28, sz*1.8, sz*0.56);  // right
+    // Panel grid lines
+    ctx.strokeStyle = '#1a3a7a'; ctx.lineWidth = 0.8;
+    for (let gi = 1; gi < 3; gi++) {
+      ctx.beginPath();
+      ctx.moveTo(sx - sz*2.2 + gi*(sz*1.8/3), sy - sz*0.28);
+      ctx.lineTo(sx - sz*2.2 + gi*(sz*1.8/3), sy + sz*0.28); ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(sx + sz*0.4 + gi*(sz*1.8/3), sy - sz*0.28);
+      ctx.lineTo(sx + sz*0.4 + gi*(sz*1.8/3), sy + sz*0.28); ctx.stroke();
+    }
+    // Body
+    ctx.fillStyle = '#b0b8c8';
+    ctx.fillRect(sx - sz*0.4, sy - sz*0.42, sz*0.8, sz*0.84);
+    ctx.fillStyle = '#888'; ctx.fillRect(sx - sz*0.3, sy - sz*0.42, sz*0.08, sz*0.84);
+    // Antenna
+    ctx.strokeStyle = '#ccc'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(sx, sy - sz*0.42); ctx.lineTo(sx, sy - sz*1.0); ctx.stroke();
+    ctx.beginPath(); ctx.arc(sx, sy - sz*1.0, 2, 0, Math.PI*2); ctx.fillStyle='#fff'; ctx.fill();
+  });
+  ctx.restore();
+}
+
+// ── DRAW: SHOOTING STARS ─────────────────────────────────────────────────────
+function updateShooters(dt, a, t) {
+  if (a < 0.84) { shooters.length = 0; return; }
+  if (t > nextShooterT) {
+    const dir = Math.random() > 0.5 ? 1 : -1;
+    shooters.push({
+      x:     dir > 0 ? 0 : W,
+      y:     Math.random() * H * 0.55,
+      vx:    dir * (6 + Math.random()*8),
+      vy:    2 + Math.random()*3.5,
+      len:   70 + Math.random()*90,
+      life:  1.0,
+      decay: 0.55 + Math.random()*0.45,
+    });
+    nextShooterT = t + 2.5 + Math.random()*6;
+  }
+  for (let i = shooters.length-1; i >= 0; i--) {
+    const s = shooters[i];
+    s.x += s.vx * dt * 60;
+    s.y += s.vy * dt * 60;
+    s.life -= s.decay * dt;
+    if (s.life <= 0 || s.y > H) shooters.splice(i, 1);
+  }
+}
+function drawShooters(a) {
+  const op = Math.max(0, (a - 0.84) / 0.06);
+  if (op <= 0 || !shooters.length) return;
+  ctx.save();
+  shooters.forEach(s => {
+    const angle = Math.atan2(s.vy, s.vx);
+    const tx = s.x - Math.cos(angle) * s.len * s.life;
+    const ty = s.y - Math.sin(angle) * s.len * s.life;
+    const g = ctx.createLinearGradient(s.x, s.y, tx, ty);
+    g.addColorStop(0, `rgba(255,255,255,${s.life * op * 0.9})`);
+    g.addColorStop(0.5,`rgba(200,220,255,${s.life * op * 0.4})`);
+    g.addColorStop(1,  'rgba(180,200,255,0)');
+    ctx.strokeStyle = g; ctx.lineWidth = 1.8;
+    ctx.beginPath(); ctx.moveTo(s.x, s.y); ctx.lineTo(tx, ty); ctx.stroke();
+  });
+  ctx.restore();
+}
+
+// ── DRAW: GROUND ─────────────────────────────────────────────────────────────
+function drawGround(a, sx) {
+  const op = Math.max(0, 1 - a * 5.5);
+  if (op <= 0) return;
+  ctx.save(); ctx.globalAlpha = op;
+  // Terrain
+  ctx.beginPath(); ctx.moveTo(0, H);
+  for (let x = 0; x <= W+6; x += 4) ctx.lineTo(x, terrainY(x+sx));
+  ctx.lineTo(W, H); ctx.closePath();
+  const g = ctx.createLinearGradient(0, GY-40, 0, H);
+  g.addColorStop(0, '#5a8e3a'); g.addColorStop(0.3,'#4a7e2a'); g.addColorStop(1,'#2a4e14');
+  ctx.fillStyle = g; ctx.fill();
+  // Trees
+  const c0 = Math.floor(sx/CHUNK)-1, c1 = c0 + Math.ceil(W/CHUNK)+3;
+  for (let ci = c0; ci <= c1; ci++) {
+    if (!hasTree(ci)) continue;
+    const wx = ci*CHUNK + hash(ci*11+1)*CHUNK;
+    drawTree(wx-sx, terrainY(wx), treeH(ci), isPine(ci));
+  }
+  ctx.restore();
+}
+function drawTree(x, baseY, h, pine) {
+  if (pine) {
+    ctx.fillStyle='#2a5818'; ctx.beginPath();
+    ctx.moveTo(x,baseY-h); ctx.lineTo(x-h*0.33,baseY); ctx.lineTo(x+h*0.33,baseY); ctx.closePath(); ctx.fill();
+    ctx.fillStyle='#3a6e22'; ctx.beginPath();
+    ctx.moveTo(x,baseY-h*1.1); ctx.lineTo(x-h*0.22,baseY-h*0.44); ctx.lineTo(x+h*0.22,baseY-h*0.44); ctx.closePath(); ctx.fill();
+  } else {
+    ctx.fillStyle='#2c5a18'; ctx.beginPath();
+    ctx.ellipse(x,baseY-h*0.55,h*0.42,h*0.56,0,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle='#3c6e22'; ctx.beginPath();
+    ctx.ellipse(x-h*0.1,baseY-h*0.68,h*0.28,h*0.36,-0.3,0,Math.PI*2); ctx.fill();
+  }
+  ctx.fillStyle='#6b4226'; ctx.fillRect(x-3, baseY-h*0.16, 6, h*0.18);
+}
+
+// ── DRAW: CLOUDS ─────────────────────────────────────────────────────────────
+function drawClouds(a, sx) {
+  clouds.forEach(c => {
+    const [lo, hi] = CLOUD_TIER[c.tier];
+    const mid  = (lo + hi) / 2;
+    const band = (hi - lo) * 0.7;
+    const op   = c.alpha * Math.max(0, 1 - Math.abs(a - mid) / band);
+    if (op < 0.04) return;
+    const scx = c.wx - sx * c.parallax;
+    // Y tracks altitude: as balloon rises clouds move down, as it falls they move up.
+    // Cloud at altitude `mid` sits at 40% from top when balloon is at that same altitude.
+    const scy = H * 0.40 + (a - mid) * H * 1.5;
+    ctx.save(); ctx.globalAlpha = Math.min(1, op);
+    drawCloudShape(scx, scy, c.w, c.h);
+    ctx.restore();
+  });
+}
+function drawCloudShape(x, y, w, h) {
+  ctx.fillStyle = 'rgba(255,255,255,0.93)';
+  ctx.beginPath();
+  ctx.ellipse(x,       y,       w*0.50,h*0.50,0,0,Math.PI*2);
+  ctx.ellipse(x-w*0.28,y+h*0.10,w*0.36,h*0.42,0,0,Math.PI*2);
+  ctx.ellipse(x+w*0.28,y+h*0.10,w*0.36,h*0.42,0,0,Math.PI*2);
+  ctx.ellipse(x-w*0.08,y-h*0.20,w*0.30,h*0.36,0,0,Math.PI*2);
+  ctx.ellipse(x+w*0.18,y-h*0.14,w*0.26,h*0.30,0,0,Math.PI*2);
+  ctx.fill();
+}
+
+// ── DRAW: BIRDS ──────────────────────────────────────────────────────────────
+function drawBirds(a, sx, t) {
+  birds.forEach(b => {
+    const vis = Math.max(0, 1 - Math.abs(a - b.band)/0.15);
+    if (vis <= 0) return;
+    const scx = b.wx - sx;
+    if (scx < -80 || scx > W+80) return;
+    const scy = H*0.22 + (1 - b.band/0.50)*H*0.32;
+    const wf  = Math.sin(t*4.5 + b.wing)*7;
+    ctx.save(); ctx.globalAlpha = vis*0.82; ctx.strokeStyle='#111'; ctx.lineWidth=1.8;
+    ctx.beginPath();
+    ctx.moveTo(scx-12, scy+wf);
+    ctx.quadraticCurveTo(scx-5, scy, scx, scy);
+    ctx.quadraticCurveTo(scx+5, scy, scx+12, scy+wf);
+    ctx.stroke(); ctx.restore();
+  });
+}
+
+// ── DRAW: JET ────────────────────────────────────────────────────────────────
+function drawJet(a, sx) {
+  if (!jet.active) return;
+  const vis = Math.max(0, 1 - Math.abs(a - 0.705)/0.11);
+  if (vis <= 0) { jet.active = false; return; }
+  const scx = jet.wx - sx, scy = H*0.20;
+  ctx.save(); ctx.globalAlpha = vis*0.92; ctx.translate(scx, scy); ctx.scale(jet.dir, 1);
+  // Contrail
+  ctx.globalAlpha = vis * 0.18;
+  for (let i=1; i<=9; i++) {
+    ctx.beginPath(); ctx.arc(-(22+i*26),(i%2)*4-2,5-i*0.35,0,Math.PI*2);
+    ctx.fillStyle='#fff'; ctx.fill();
+  }
+  ctx.globalAlpha = vis * 0.92;
+  ctx.fillStyle='#ccd4e0';
+  ctx.beginPath(); ctx.ellipse(0,0,30,5.5,0,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle='#bbc4d4';
+  ctx.beginPath(); ctx.moveTo(5,0); ctx.lineTo(-7,-20); ctx.lineTo(-18,-20); ctx.lineTo(-13,0); ctx.closePath(); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(5,0); ctx.lineTo(-7, 20); ctx.lineTo(-18, 20); ctx.lineTo(-13,0); ctx.closePath(); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(-22,0); ctx.lineTo(-30,-11); ctx.lineTo(-30,0); ctx.closePath(); ctx.fill();
+  ctx.fillStyle='#a0a8b8';
+  ctx.beginPath(); ctx.ellipse(-7,-13,7,3,0,0,Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.ellipse(-7, 13,7,3,0,0,Math.PI*2); ctx.fill();
+  ctx.restore();
+}
+
+// ── DRAW: BALLOON ────────────────────────────────────────────────────────────
+const STRIPES = ['#e63946','#f4864a','#e9c46a','#2a9d8f','#457b9d','#9b5de5'];
+
+function drawBalloon(bx, by, flame, crashed) {
+  // Geometry — by is the CENTER of the envelope ellipse
+  const eH    = Math.min(H * 0.19, 150);   // vertical radius
+  const eW    = eH * 0.74;                  // horizontal radius
+  const eBot  = by + eH;                    // TRUE bottom of envelope ellipse
+  const ropeL = eH * 0.16;                  // rope length
+  const bskT  = eBot + ropeL;              // basket top Y
+  const bskW  = eW  * 0.28;               // basket half-width (-30%)
+  const bskH  = eH  * 0.22;               // basket height
+
+  if (crashed) { drawCrash(bx, GY, eH); return; }
+
+  // ── Outer glow from flame ──
+  if (flame > 0.08) {
+    const glow = ctx.createRadialGradient(bx, eBot, 0, bx, by, eW*1.3);
+    glow.addColorStop(0, `rgba(255,130,0,${flame*0.40})`);
+    glow.addColorStop(1, 'rgba(255,60,0,0)');
+    ctx.fillStyle = glow;
+    ctx.beginPath(); ctx.ellipse(bx, by, eW*1.3, eH, 0, 0, Math.PI*2); ctx.fill();
+  }
+
+  // ── Envelope — HORIZONTAL stripes ──
+  ctx.save();
+  ctx.beginPath(); ctx.ellipse(bx, by, eW, eH, 0, 0, Math.PI*2); ctx.clip();
+  const sh = (eH * 2) / STRIPES.length;   // stripe height
+  STRIPES.forEach((c, i) => {
+    ctx.fillStyle = c;
+    ctx.fillRect(bx - eW, by - eH + i * sh, eW * 2, sh);
+  });
+  // Specular highlight
+  const hl = ctx.createRadialGradient(bx - eW*0.22, by - eH*0.28, 0, bx, by, eW*1.1);
+  hl.addColorStop(0,   'rgba(255,255,255,0.30)');
+  hl.addColorStop(0.5, 'rgba(255,255,255,0.04)');
+  hl.addColorStop(1,   'rgba(0,0,0,0.16)');
+  ctx.fillStyle = hl;
+  ctx.fillRect(bx-eW, by-eH, eW*2, eH*2);
+  ctx.restore();
+
+  // Envelope outline
+  ctx.strokeStyle = 'rgba(0,0,0,0.25)'; ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.ellipse(bx, by, eW, eH, 0, 0, Math.PI*2); ctx.stroke();
+
+  // ── Ropes (4 lines from lower envelope to basket corners) ──
+  ctx.strokeStyle = '#9b7520'; ctx.lineWidth = 1.1;
+  const ropeAttachY = by + eH * 0.80;   // slightly above true bottom for visual
+  [[-bskW*0.45], [bskW*0.45], [-bskW*0.15], [bskW*0.15]].forEach(([dx]) => {
+    ctx.beginPath();
+    ctx.moveTo(bx + dx * 1.6, ropeAttachY);
+    ctx.lineTo(bx + dx, bskT);
+    ctx.stroke();
+  });
+
+  // ── Basket ──
+  ctx.fillStyle = '#a07a22'; ctx.strokeStyle = '#704e10'; ctx.lineWidth = 1.5;
+  rrect(ctx, bx - bskW, bskT, bskW*2, bskH, 3); ctx.fill(); ctx.stroke();
+  // Wicker lines
+  ctx.strokeStyle = 'rgba(0,0,0,0.18)'; ctx.lineWidth = 0.7;
+  for (let xi = 1; xi < 4; xi++) {
+    const lx = bx - bskW + xi*(bskW*2/4);
+    ctx.beginPath(); ctx.moveTo(lx,bskT); ctx.lineTo(lx,bskT+bskH); ctx.stroke();
+  }
+  ctx.beginPath(); ctx.moveTo(bx-bskW,bskT+bskH*0.5); ctx.lineTo(bx+bskW,bskT+bskH*0.5); ctx.stroke();
+
+  // ── Pilot ──
+  const ps  = bskH * 0.24;
+  const px  = bx;
+  const py  = bskT - ps * 0.2;   // head just above basket rim
+  ctx.fillStyle = '#1a1a1a';
+  ctx.beginPath(); ctx.arc(px, py, ps, 0, Math.PI*2); ctx.fill();     // head
+  ctx.fillRect(px - ps*0.45, py + ps, ps*0.9, bskH*0.3);              // body in basket
+  ctx.strokeStyle = '#1a1a1a'; ctx.lineWidth = 2.4;
+  // Arms reaching up to burner cord
+  ctx.beginPath(); ctx.moveTo(px - ps*0.45, py + ps*1.1); ctx.lineTo(px - ps*0.9, eBot - 4); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(px + ps*0.45, py + ps*1.1); ctx.lineTo(px + ps*0.9, eBot - 4); ctx.stroke();
+
+  // ── Flame (inside envelope, from eBot upward) ──
+  if (flame > 0.04) {
+    const fh = 20 + flame * 55;
+    const fw = 6  + flame * 12;
+    const fy = eBot - 4;
+    ctx.save();
+    // Clip to inside envelope so flame stays inside balloon
+    ctx.beginPath(); ctx.ellipse(bx, by, eW*0.9, eH*0.9, 0, 0, Math.PI*2); ctx.clip();
+    const fg = ctx.createLinearGradient(bx, fy, bx, fy-fh);
+    fg.addColorStop(0,   `rgba(255,60,0,${0.95*flame})`);
+    fg.addColorStop(0.45,`rgba(255,140,0,${0.85*flame})`);
+    fg.addColorStop(1,   'rgba(255,230,50,0)');
+    ctx.fillStyle = fg; ctx.beginPath();
+    ctx.moveTo(bx-fw, fy);
+    ctx.quadraticCurveTo(bx-fw*0.2, fy-fh*0.6, bx, fy-fh);
+    ctx.quadraticCurveTo(bx+fw*0.2, fy-fh*0.6, bx+fw, fy);
+    ctx.closePath(); ctx.fill();
+    // Inner hot core
+    const fg2 = ctx.createLinearGradient(bx, fy, bx, fy-fh*0.55);
+    fg2.addColorStop(0, `rgba(255,220,60,${flame})`);
+    fg2.addColorStop(1, 'rgba(255,255,180,0)');
+    ctx.fillStyle=fg2; ctx.globalAlpha=flame;
+    ctx.beginPath(); ctx.moveTo(bx-fw*0.35,fy); ctx.quadraticCurveTo(bx,fy-fh*0.65,bx+fw*0.35,fy); ctx.closePath(); ctx.fill();
+    ctx.restore();
+  }
+}
+
+function drawCrash(bx, gy, eH) {
+  ctx.save(); ctx.globalAlpha = 0.80;
+  ctx.fillStyle='#e63946';
+  ctx.beginPath(); ctx.ellipse(bx-20,gy-14,eH*0.52,eH*0.12,-0.25,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle='#457b9d';
+  ctx.beginPath(); ctx.ellipse(bx+28,gy-9,eH*0.38,eH*0.09,0.35,0,Math.PI*2); ctx.fill();
+  ctx.globalAlpha=1; ctx.fillStyle='#a07a22';
+  ctx.save(); ctx.translate(bx-10,gy-12); ctx.rotate(0.65); ctx.fillRect(-20,-12,40,24); ctx.restore();
+  ctx.restore();
+}
+
+function rrect(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x+r,y); ctx.lineTo(x+w-r,y); ctx.arcTo(x+w,y,x+w,y+r,r);
+  ctx.lineTo(x+w,y+h-r); ctx.arcTo(x+w,y+h,x+w-r,y+h,r);
+  ctx.lineTo(x+r,y+h); ctx.arcTo(x,y+h,x,y+h-r,r);
+  ctx.lineTo(x,y+r); ctx.arcTo(x,y,x+r,y,r); ctx.closePath();
+}
+
+// ── DRAW: HUD ────────────────────────────────────────────────────────────────
+function drawHUD(a, ctrl) {
+  document.getElementById('zone').textContent = getZone(a).name;
+  // Altitude bar
+  const bx = W-38, by2 = H*0.16, bh = H*0.66, bw = 14;
+  ctx.fillStyle='rgba(0,0,0,0.32)';
+  rrect(ctx, bx-4, by2-4, bw+8, bh+8, 5); ctx.fill();
+  ZONES.forEach(z => {
+    const ty = by2 + bh*(1-z.lo);
+    ctx.strokeStyle='rgba(255,255,255,0.10)'; ctx.lineWidth=0.5;
+    ctx.beginPath(); ctx.moveTo(bx,ty); ctx.lineTo(bx+bw,ty); ctx.stroke();
+  });
+  const fh2 = bh*a;
+  const bg = ctx.createLinearGradient(0,by2+bh,0,by2);
+  bg.addColorStop(0,'#2a6ad5'); bg.addColorStop(0.6,'#7eb8f7'); bg.addColorStop(1,'#b0eaff');
+  ctx.fillStyle=bg; ctx.fillRect(bx, by2+bh-fh2, bw, fh2);
+  ctx.fillStyle='#fff';
+  ctx.beginPath(); ctx.arc(bx+bw/2, by2+bh*(1-a), 5.5, 0, Math.PI*2); ctx.fill();
+  // Focus label
+  const fi = ctrl > 0.5 ? (ctrl-0.5)*2 : 0;
+  if (fi > 0.05) {
+    ctx.save(); ctx.globalAlpha = fi*0.85;
+    ctx.fillStyle='#f7d090'; ctx.font=`bold ${13+fi*9|0}px monospace`;
+    ctx.textAlign='center'; ctx.fillText('FOCUS', W/2, H-26);
+    ctx.restore();
+  }
+  if (!ble.connected) {
+    ctx.fillStyle='rgba(255,255,255,0.20)'; ctx.font='10px monospace'; ctx.textAlign='left';
+    ctx.fillText('DEMO', 16, H-16);
+  }
+}
+
+// ── UPDATE ───────────────────────────────────────────────────────────────────
+function update(dt, t) {
+  if (!ble.connected || !sig.calibDone) {
+    // Demo: slow scenic tour through all zones
+    sig.control = Math.max(0.05, Math.min(0.95,
+      0.5 + 0.40 * Math.sin(t*0.22) + 0.07*Math.sin(t*0.88)
+    ));
+  }
+  if (!gameReady && !ble.connected) gameReady = true;
+  if (!gameReady) return;
+
+  if (bal.crashed) {
+    bal.crashT -= dt;
+    if (bal.crashT <= 0) {
+      bal.crashed = false; bal.alt = 0; bal.vel = 0;
+      document.getElementById('crash-msg').style.display = 'none';
+    }
+    return;
+  }
+
+  // Flame smoothing
+  const tFlame = sig.control > 0.5 ? (sig.control-0.5)*2 : 0;
+  bal.flame += (tFlame - bal.flame) * 0.10;
+
+  // Physics
+  const lift = (sig.control - LIFT_ZERO) * LIFT_SCALE;
+  bal.vel += lift - GRAVITY;
+  bal.vel *= DAMPING;
+  bal.alt += bal.vel;
+
+  // Ground collision
+  if (bal.alt <= 0) {
+    if (bal.vel < CRASH_VEL) {
+      bal.crashed = true; bal.crashT = 4.0; bal.vel = 0; bal.alt = 0;
+      document.getElementById('crash-msg').style.display = 'block';
+    } else {
+      bal.alt = 0; bal.vel = Math.max(0, bal.vel * 0.15);
+    }
+  }
+  bal.alt = Math.min(1, bal.alt);
+
+  // World scroll
+  scrollX += 1.35 * dt * 60;
+
+  // Cloud recycle
+  clouds.forEach(c => {
+    if (c.wx - scrollX*c.parallax < -c.w*2)
+      c.wx = scrollX*c.parallax + W + c.w + Math.random()*350;
+  });
+
+  // Birds
+  birds.forEach(b => b.wx -= b.speed);
+  for (let i=birds.length-1; i>=0; i--) { if (birds[i].wx < scrollX-100) birds.splice(i,1); }
+  if (scrollX > nextBirdWX) {
+    spawnBirds(scrollX + W + 80 + Math.random()*180);
+    nextBirdWX = scrollX + W + 280 + Math.random()*450;
+  }
+
+  // Jet
+  if (bal.alt>0.63 && bal.alt<0.80 && !jet.active && Math.random()<0.004) spawnJet();
+  if (jet.active) { jet.wx += 9*jet.dir; if (Math.abs(jet.wx-scrollX-W/2)>W) jet.active=false; }
+
+  // Shooting stars
+  updateShooters(dt, bal.alt, t);
+}
+
+// ── RENDER ───────────────────────────────────────────────────────────────────
+function render(t) {
+  const a = bal.alt;
+  // Balloon screen position: basket bottom touches GY at alt=0
+  const eH    = Math.min(H*0.19, 150);
+  const ropeL = eH*0.16;
+  const bskH  = eH*0.22;
+  // byMax: at alt=0, basket bottom (by+eH+ropeL+bskH) = GY
+  const byMax = GY - eH - ropeL - bskH;
+  const byMin = H * 0.16;
+  const by    = byMax - a*(byMax - byMin);
+  const bx    = W * 0.35;
+
+  drawSky(a);
+  drawStars(a, t);
+  drawEarth(a);
+  drawSatellites(a, t);
+  drawShooters(a);
+  drawClouds(a, scrollX);
+  drawGround(a, scrollX);
+  drawBirds(a, scrollX, t);
+  drawJet(a, scrollX);
+  drawBalloon(bx, by, bal.flame, bal.crashed);
+  drawHUD(a, sig.control);
+}
+
+// ── LOOP ─────────────────────────────────────────────────────────────────────
+function loop(ts) {
+  const dt = Math.min((ts - lastTS) / 1000, 0.05);
+  lastTS = ts;
+  demoT += dt;
+  update(dt, demoT);
+  render(demoT);
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(ts => { lastTS = ts; requestAnimationFrame(loop); });
+</script>
 </body>
 </html>
